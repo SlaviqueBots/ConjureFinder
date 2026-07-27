@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows-exe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip install pyinstaller
+
+      - name: Build exe
+        run: python scripts/build_conjure_finder_exe.py
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $raw = Get-Content -Raw conjure_finder/__init__.py
+          if ($raw -match '__version__\s*=\s*"([^"]+)"') {
+            $v = $Matches[1]
+          } else {
+            throw "Could not parse __version__"
+          }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "version=$v"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ConjureFinder-windows
+          path: |
+            releases/ConjureFinder-v*-windows.exe
+            releases/ConjureFinder-v*-windows.exe.sha256
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Conjure Finder v${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            releases/ConjureFinder-v${{ steps.ver.outputs.version }}-windows.exe
+            releases/ConjureFinder-v${{ steps.ver.outputs.version }}-windows.exe.sha256
+          fail_on_unmatched_files: true

@@ -1,0 +1,50 @@
+# Secrets / local config
+.env
+conjure_finder.env
+*.env
+!conjure_finder.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.spec
+
+# Tests / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Local build / release artifacts (CI uploads these; do not commit binaries)
+releases/*.exe
+releases/*.exe.sha256
+releases/version.json
+!releases/.gitkeep
+
+# PyInstaller / frozen leftovers
+*.exe
+*.exe.new
+*.exe.bak
+_update_conjure_finder.bat
+_update_conjure_finder.ps1
+_update_fail.txt
+_UPDATE_START_HERE.txt
+
+# Local diagnostics (never ship)
+_diag_*.py
+_diag_*.txt
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
