@@ -1,51 +1,23 @@
-# Conjure Finder (PC tool)
+# Conjure Finder
 
-Standalone English GUI — cheapest `/conjure` path for a Danbooru or Rule34 post.
+Desktop GUI that finds the cheapest `/conjure` path for a Danbooru or Rule34 post. Read-only: it never modifies the bot.
 
-**Does not modify the bot.**
+## Run
 
-## One-click launch (PC)
+Needs Python 3 with Tkinter (`pip install -r requirements.txt`), then:
 
-In the project folder (next to `bot/`), double-click:
+```bash
+python -m conjure_finder
+```
 
-**`Conjure Finder.vbs`** ← use this on Windows
+Paste post URLs — one per line for separate jobs, space-separated on one line for an any-of group (variants, same-author sets). Copy the resulting command(s) into the bot chat. **Bulk wishlist** mode ranks paths across many posts of one character/artist, with save/load for results.
 
-Fallbacks: `Conjure Finder.bat` (Windows) or `Conjure Finder.sh` (Linux/macOS).
+## API keys
 
-First click installs deps and pulls API keys if needed. Optional: Desktop shortcut to the `.vbs`.
+Danbooru username + API key and Rule34 key + user id go in **Settings…** inside the app (stored locally, never in this repo).
 
-## API keys / Settings
+## How it searches
 
-Open **Settings…** in the app to enter:
-
-- Danbooru username + API key
-- Rule34 API key + user id
-
-Saved to **`conjure_finder.env`** next to `bot/` (gitignored). That file overrides any shared project `.env` so a distributed build never needs your server keys.
-
-During development, keys already in `.env` still work until you save Settings.
-
-## Behavior
-
-- Paste one or many URLs (**one per line** = separate searches). Danbooru and Rule34 queues run **in parallel**.
-- **Same line** (space or `|`) = **any-of** group: success = get any of those posts (variants / same author sets).
-- Max 2 tags; pricing matches the bot (general 25 / premium 50).
-- 1 free reroll ⇒ pool ≤ 2 is a single-conjure guarantee.
-- Same-tag pity (bot): expected sessions/cost assume without-replacement until the pool reshuffles. Any-of groups score with K acceptable hits in the pool.
-- Also considers roster paths: conjure artist → Author, or conjure character → reshape / reshape_m (solo vs not). Rule34 AI uses `/conjure_hell_slop`.
-- Searches cheapest-first; stops on the first guarantee per job.
-- English UI; Copy command(s) copies every successful result.
-
-## Requirements
-
-Python 3 with tcl/tk (Windows installer options: PATH + tcl/tk).
-
-## Personal vs share builds
-
-| | Personal (this repo) | Friends (portable exe) |
-|---|---|---|
-| Keys | Your `.env` / `conjure_finder.env` | Empty — they use **Settings…** |
-| Launch | `Conjure Finder.vbs` here | **`ConjureFinder-v*-windows.exe`** from a GitHub Release |
-| Refresh share | `python scripts/build_conjure_finder_exe.py` then tag `vX.Y.Z` | Friends download the Release asset |
-
-See the root `README.md` for the full release flow.
+- Pricing mirrors the bot: regular tags 25, character/title/author tags 50, one free reroll.
+- Considers `/beckon` peeks on sparse tags, roster paths (conjure artist → Author, conjure character → reshape), and targeted excludes.
+- Cheapest-first; stops at the first guaranteed path per job.
