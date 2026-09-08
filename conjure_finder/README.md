@@ -1,6 +1,6 @@
 # Conjure Finder
 
-> 100% vibecoded — written entirely with AI assistance, no hand-written code.
+> 100% vibecoded — no hand-written code.
 
 Desktop GUI that finds the cheapest `/conjure` path for a Danbooru or Rule34 post. Read-only: it never modifies the bot.
 
