@@ -1,5 +1,7 @@
 # Conjure Finder
 
+> 100% vibecoded — written entirely with AI assistance, no hand-written code.
+
 Find the cheapest bot `/conjure` (or `/conjure_hell`) command for a Danbooru or Rule34 post.
 
 ## Download (share this)
