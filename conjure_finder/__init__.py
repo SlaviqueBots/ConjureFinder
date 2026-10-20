@@ -1,3 +1,3 @@
 """Standalone PC tool: cheapest conjure path for a Danbooru / Rule34 post."""
 
-__version__ = "1.0.2"
+__version__ = "1.1.2"

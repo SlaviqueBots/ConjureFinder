@@ -26,7 +26,7 @@ def _link_label(parent: tk.Misc, url: str) -> ttk.Label:
 
 
 class SettingsDialog(tk.Toplevel):
-    def __init__(self, master: tk.Tk) -> None:
+    def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
         self.title("Conjure Finder — Settings")
         self.transient(master)

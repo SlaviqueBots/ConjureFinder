@@ -1,12 +1,14 @@
 """Pure expected-cost math — no I/O."""
 
 from conjure_finder.engine import (
+    BECKON_PRICE,
+    BECKON_PEEKS,
     GUARANTEE_POOL_MAX,
     _expected_action_clicks,
+    _expected_beckon_sessions,
     _expected_sessions,
     _hit_probability,
 )
-
 
 def test_pool_leq_guarantee_max_is_one_session() -> None:
     for pool in (1, 2, GUARANTEE_POOL_MAX):
@@ -45,3 +47,22 @@ def test_author_large_pool_peeks_shrink_remainder() -> None:
     # p_miss * (8+1)/2
     p_miss = 1.0 - _hit_probability(10, 1)
     assert abs(clicks - p_miss * 4.5) < 1e-9
+
+
+def test_beckon_pool_leq_peeks_is_one_session() -> None:
+    for pool in (1, 5, BECKON_PEEKS):
+        assert _expected_beckon_sessions(pool) == 1.0
+
+
+def test_beckon_pool_eleven_expected_sessions() -> None:
+    # E(10)=1; E(11)=1 + (1/11)*1 = 12/11
+    assert abs(_expected_beckon_sessions(11) - 12.0 / 11.0) < 1e-9
+    assert abs(BECKON_PRICE * _expected_beckon_sessions(11) - BECKON_PRICE * 12.0 / 11.0) < 1e-9
+
+
+def test_beckon_beats_conjure_on_sparse_general() -> None:
+    """Pool 5: conjure ~41.7 cur vs beckon guarantee 30."""
+    conjure_cur = 25.0 * _expected_sessions(5)
+    beckon_cur = BECKON_PRICE * _expected_beckon_sessions(5)
+    assert beckon_cur == BECKON_PRICE
+    assert beckon_cur < conjure_cur

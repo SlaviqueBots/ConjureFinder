@@ -35,6 +35,9 @@ HIDDEN_IMPORTS = [
     "conjure_finder.gui",
     "conjure_finder.engine",
     "conjure_finder.batch",
+    "conjure_finder.bulk",
+    "conjure_finder.previews",
+    "conjure_finder.saves",
     "conjure_finder.urls",
     "conjure_finder.settings",
     "conjure_finder.settings_ui",
@@ -64,6 +67,9 @@ HIDDEN_IMPORTS = [
     "h11",
     "idna",
     "sniffio",
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageTk",
 ]
 
 

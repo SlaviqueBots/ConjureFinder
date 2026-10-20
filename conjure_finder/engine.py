@@ -1,8 +1,9 @@
-"""Find the cheapest conjure query that can hit a specific post.
+"""Find the cheapest conjure/beckon query that can hit a specific post.
 
 Mirrors bot conjure rules (max 2 tags, 25/50 pricing, 1 free reroll,
-cross-session same-tag pity) without changing any bot code. Imports pricing
-helpers and API clients read-only.
+cross-session same-tag pity) and /beckon (single general tag, 10 peeks,
+fixed cost) without changing any bot code. Imports pricing helpers and API
+clients read-only.
 """
 
 from __future__ import annotations
@@ -25,12 +26,41 @@ HellMode = Literal["hell", "slop", ""]
 # reshuffles — expected cost uses without-replacement across sessions.
 GUARANTEE_POOL_MAX = 2
 
+# /beckon shows up to this many images; pool ≤ this is a single-beckon guarantee.
+# Keep in sync with bot BECKON_PRICE / BECKON_MAX_POSTS (live bot on Koara).
+BECKON_PRICE = 30
+BECKON_PEEKS = 10
+
 MAX_GENERAL_FOR_PAIRS = 30
 MAX_PAIR_CHECKS_PER_TIER = 100
 MAX_CROSS_CHECKS_PER_TIER = 120
 # Always pair these rarest tags with every tag in the pair pool — catches
 # small intersections that plain min(count) ranking would push past the cap.
 FORCE_PAIR_ANCHORS = 5
+# Cap how many beckonable singles we live-count (rarest first).
+MAX_BECKON_CHECKS = 40
+
+# Bot @refine / /refine — fixed exclude-tag crafts on Author/reshape.
+# Mirror live bot REFINE_EXCLUDE_TAGS (reshape.py). ALL (mega) is skipped here:
+# it needs ~6 counts to pick an API exclude, then client-side multi-tag reject,
+# so pool math is unreliable and search time blows up for little gain over a
+# single targeted −tag when the post lacks that trash tag.
+REFINE_EXCLUDE_TAGS: tuple[str, ...] = (
+    "greyscale",
+    "simple_background",
+    "white_background",
+    "monochrome",
+    "comic",
+    "gradient_background",
+)
+# Live refine probes: top roster anchors × excludes the target lacks.
+MAX_REFINE_ANCHORS = 2
+MAX_REFINE_CHECKS = 12
+
+# _probe pool sentinels (live counts are always >= 0).
+_POOL_CANCELLED = -1
+_POOL_SKIP = -2
+_POOL_FAILED = -3
 
 
 @dataclass(frozen=True)
@@ -53,7 +83,7 @@ class ConjureOption:
     expected_sessions: float
     expected_currency: float
     note: str = ""
-    # conjure | author | reshape | reshape_m
+    # conjure | beckon | author | reshape | reshape_m | refine
     path: str = "conjure"
 
 
@@ -153,6 +183,40 @@ def _expected_sessions(pool: int, hits: int = 1) -> float:
     return exp
 
 
+def _expected_beckon_sessions(
+    pool: int, hits: int = 1, peeks: int = BECKON_PEEKS
+) -> float:
+    """Expected paid beckons until any of ``hits`` acceptable posts appears.
+
+    Each beckon shows ``min(peeks, pool)`` distinct images. A miss keeps one
+    non-target image (excluded from later beckons of the same tag); images
+    shown but not kept can appear again. When ``pool <= peeks`` the whole
+    pool is shown → single-session guarantee.
+    """
+    if pool <= 0 or hits <= 0:
+        return float("inf")
+    hits = min(hits, pool)
+    if peeks <= 0:
+        return float("inf")
+    peeks_cap = min(peeks, pool)
+    if pool <= peeks_cap:
+        return 1.0
+
+    # E(n) = 1 + P(miss|n) * E(n-1); E(n)=1 when n <= peeks or a hit is forced.
+    e = 1.0
+    for n in range(peeks_cap + 1, pool + 1):
+        if peeks_cap > n - hits:
+            p_miss = 0.0
+        elif hits == 1:
+            p_miss = (n - peeks_cap) / float(n)
+        else:
+            total = _comb(n, peeks_cap)
+            miss = _comb(n - hits, peeks_cap)
+            p_miss = (miss / float(total)) if total > 0 else 0.0
+        e = 1.0 + p_miss * e
+    return e
+
+
 def _expected_action_clicks(
     action_pool: int,
     *,
@@ -199,7 +263,15 @@ def _expected_action_clicks(
 
 def _option_rank_key(opt: ConjureOption) -> tuple:
     """Lower is better. Prefer cheaper, then guarantees, then author paths."""
-    path_bias = {"author": 0, "reshape": 1, "reshape_m": 1, "conjure": 2}.get(opt.path, 3)
+    path_bias = {
+        "author": 0,
+        "reshape": 1,
+        "reshape_m": 1,
+        # Refine is the same craft family as reshape/Author, just with −exclude.
+        "refine": 1,
+        "beckon": 2,
+        "conjure": 3,
+    }.get(opt.path, 4)
     return (
         opt.expected_currency,
         0 if opt.guaranteed else 1,
@@ -244,9 +316,88 @@ def _bot_command(source: Source, tags: list[str], hell_mode: HellMode) -> str:
     return f"/conjure_hell {joined}"
 
 
+def _beckon_command(source: Source, tag: str, hell_mode: HellMode) -> str:
+    # Bot only registers /beckon and /beckon_hell (no _slop). Hell draws use
+    # build_r34_query (−ai_generated), so AI posts are not beckon targets.
+    if source == "danbooru":
+        return f"/beckon {tag}"
+    return f"/beckon_hell {tag}"
+
+
+def _is_beckonable(tag: PricedTag) -> bool:
+    """Bot validate_general: category 0 only, no cosplay tags."""
+    if tag.category != 0:
+        return False
+    if "(cosplay)" in tag.name:
+        return False
+    return True
+
+def _danbooru_preview_url(raw: dict) -> str:
+    """Best static thumb URL from a posts/{id}.json payload."""
+    from bot.services.danbooru import _abs_url
+
+    preview = _abs_url(raw.get("preview_file_url"))
+    large = _abs_url(raw.get("large_file_url"))
+    file_url = _abs_url(raw.get("file_url"))
+    for url in (preview, large, file_url):
+        if not url:
+            continue
+        ext = url.split("?")[0].rsplit(".", 1)[-1].lower()
+        if ext not in ("gif", "mp4", "webm", "zip", "swf"):
+            return url
+    return preview or large or file_url or ""
+
+
+async def _httpx_get_retry(
+    client,
+    path: str,
+    *,
+    progress: ProgressCb | None = None,
+    cancel_check: CancelCheck | None = None,
+    label: str = "",
+    attempts: int = 4,
+):
+    """GET with retries — Danbooru often drops mid-batch TLS when clients churn."""
+    import httpx
+
+    timeout = httpx.Timeout(30.0, connect=12.0)
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        if _cancelled(cancel_check):
+            raise ValueError("Search cancelled.")
+        try:
+            return await client.get(path, timeout=timeout)
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.RemoteProtocolError,
+            httpx.PoolTimeout,
+        ) as exc:
+            last = exc
+            if attempt >= attempts:
+                break
+            wait = 0.7 * attempt
+            _progress(
+                progress,
+                f"{label} network glitch ({type(exc).__name__}) — "
+                f"retry {attempt}/{attempts} in {wait:.1f}s…",
+            )
+            await asyncio.sleep(wait)
+    raise ValueError(
+        f"{label or path} failed after {attempts} tries"
+        + (f": {last}" if last else ".")
+    )
+
+
 async def _load_danbooru_tags(
-    post_id: int, progress: ProgressCb | None, cancel_check: CancelCheck | None
-) -> tuple[list[PricedTag], str, list[str], PostMeta]:
+    post_id: int,
+    progress: ProgressCb | None,
+    cancel_check: CancelCheck | None,
+    *,
+    client=None,
+) -> tuple[list[PricedTag], str, list[str], PostMeta, str]:
     from bot.services.conjure_pricing import conjure_price_for_tag, conjure_tag_kind_label
     from bot.services.danbooru import DanbooruClient
     from bot.utils.booru_tags import is_meta_search_tag
@@ -259,8 +410,10 @@ async def _load_danbooru_tags(
             "Danbooru API keys missing — open Settings…, enter login username + API key, Save."
         )
 
-    client = DanbooruClient()
-    await client.start()
+    own_client = client is None
+    if own_client:
+        client = DanbooruClient()
+        await client.start()
     try:
         assert client._client
         # Confirm the HTTP client actually got auth (guards against stale CFG bugs).
@@ -271,7 +424,13 @@ async def _load_danbooru_tags(
         from bot.core.rate_limit import DANBOORU_RL
 
         await DANBOORU_RL.acquire()
-        r = await client._client.get(f"/posts/{int(post_id)}.json")
+        r = await _httpx_get_retry(
+            client._client,
+            f"/posts/{int(post_id)}.json",
+            progress=progress,
+            cancel_check=cancel_check,
+            label=f"Danbooru #{post_id}",
+        )
         if r.status_code == 401:
             raise ValueError(
                 "Danbooru 401 Unauthorized — use your Danbooru login name (not email) "
@@ -285,6 +444,7 @@ async def _load_danbooru_tags(
             raise ValueError(f"Danbooru post {post_id} not found (HTTP {r.status_code}).")
         raw = r.json()
         file_ext = (raw.get("file_ext") or "").lower()
+        preview_url = _danbooru_preview_url(raw)
         if file_ext in ("webm", "swf", "zip"):
             warnings.append(
                 f"This post is .{file_ext}. The bot cannot deliver webm/swf/zip via /conjure — "
@@ -315,11 +475,11 @@ async def _load_danbooru_tags(
         names = [n for n, _ in unique_buckets]
         _progress(
             progress,
-            f"Pricing {len(names)} tags (batch lookup)…",
+            f"Pricing {len(names)} tags on #{post_id} (batch lookup)…",
         )
         if _cancelled(cancel_check):
             warnings.append("Cancelled while loading tags.")
-            return [], file_ext, warnings, PostMeta()
+            return [], file_ext, warnings, PostMeta(), preview_url
 
         # One HTTP call for ≤100 tags (chunked) — not one request per tag.
         info_map = await client.tag_info_many(names)
@@ -348,7 +508,7 @@ async def _load_danbooru_tags(
                     post_count=post_count,
                 )
             )
-        _progress(progress, f"Priced {len(priced)} tags.")
+        _progress(progress, f"Priced {len(priced)} tags on #{post_id}.")
         rating = (raw.get("rating") or "e").lower()[:1]
         if rating not in ("g", "s", "q", "e"):
             rating = "e"
@@ -359,14 +519,15 @@ async def _load_danbooru_tags(
             artists=[t for t in priced if t.category == 1],
             characters=[t for t in priced if t.category == 4],
         )
-        return priced, file_ext, warnings, meta
+        return priced, file_ext, warnings, meta, preview_url
     finally:
-        await client.stop()
+        if own_client:
+            await client.stop()
 
 
 async def _load_rule34_tags(
     post_id: int, progress: ProgressCb | None, cancel_check: CancelCheck | None
-) -> tuple[list[PricedTag], str, list[str], HellMode, PostMeta]:
+) -> tuple[list[PricedTag], str, list[str], HellMode, PostMeta, str]:
     from bot.services.conjure_pricing import conjure_price_for_tag, conjure_tag_kind_label
     from bot.services.rule34 import Rule34Client
     from bot.utils.booru_tags import is_meta_search_tag
@@ -380,6 +541,17 @@ async def _load_rule34_tags(
         post = await client.fetch_by_id(post_id, allow_ai=True)
         if not post:
             raise ValueError(f"Rule34 post {post_id} not found.")
+
+        preview_url = (getattr(post, "preview_url", None) or "").strip()
+        if not preview_url:
+            for url in (
+                getattr(post, "sample_url", None),
+                getattr(post, "image_url", None),
+                getattr(post, "file_url", None),
+            ):
+                if url and str(url).strip():
+                    preview_url = str(url).strip()
+                    break
 
         tag_names = [t for t in (post.tags or "").split() if t]
         if not tag_names:
@@ -559,7 +731,7 @@ async def _load_rule34_tags(
                 if t.category == 4 or t.name in char_names
             ],
         )
-        return priced_list, file_ext, warnings, hell_mode, meta
+        return priced_list, file_ext, warnings, hell_mode, meta, preview_url
     finally:
         await client.stop()
 
@@ -804,14 +976,14 @@ class _CountSession:
         if self.source == "danbooru":
             assert self._danbooru
             assert self._danbooru._client
-            for attempt in range(3):
+            for attempt in range(5):
                 try:
                     await self._finder_acquire()
                     r = await self._danbooru._client.get(
                         "/counts/posts.json", params={"tags": query}
                     )
                     if r.status_code != 200:
-                        await asyncio.sleep(0.25 * (attempt + 1))
+                        await asyncio.sleep(0.35 * (attempt + 1))
                         continue
                     n = int(r.json().get("counts", {}).get("posts", 0) or 0)
                     if 0 < n <= GUARANTEE_POOL_MAX:
@@ -836,7 +1008,7 @@ class _CountSession:
                                 return accessible
                     return n
                 except Exception:
-                    await asyncio.sleep(0.25 * (attempt + 1))
+                    await asyncio.sleep(0.35 * (attempt + 1))
             return -1
 
         assert self._rule34
@@ -863,6 +1035,106 @@ class TargetSnap:
     meta: PostMeta
     hell_mode: HellMode
     warnings: list[str] = field(default_factory=list)
+    preview_url: str = ""
+    page_url: str = ""
+
+
+def post_page_url(source: Source, post_id: int) -> str:
+    if source == "danbooru":
+        return f"https://danbooru.donmai.us/posts/{int(post_id)}"
+    return f"https://rule34.xxx/index.php?page=post&s=view&id={int(post_id)}"
+
+
+def _make_action_path_option(
+    *,
+    source: Source,
+    hell_mode: HellMode,
+    tag: str,
+    pool: int,
+    path: str,
+    action_cost: int,
+    action_label: str,
+    hits: int,
+    conjure_pool: int | None = None,
+    owned: bool = False,
+    option_tags: tuple[str, ...] | None = None,
+) -> ConjureOption | None:
+    """Build conjure-then-action (Author/reshape/refine) expected-cost option."""
+    if pool <= 0 or hits <= 0:
+        return None
+    hits = min(hits, pool)
+    tags = option_tags if option_tags is not None else (tag,)
+    if owned:
+        # Already on roster — only pay action clicks; no conjure peeks.
+        e_clicks = (pool + 1) / float(hits + 1)
+        guar = pool <= hits
+        conjure_cost = 0
+        e_cur = action_cost * e_clicks
+        hit_note = f", {hits} acceptable" if hits > 1 else ""
+        plan = f"(already have) {action_label} (~{e_clicks:.0f}× @{action_cost})"
+        note = (
+            f"Owned roster: skip conjure; {action_label} until any acceptable "
+            f"(filter pool {pool}{hit_note})."
+        )
+        return ConjureOption(
+            tags=tags,
+            cost=conjure_cost,
+            pool_size=pool,
+            guaranteed=guar,
+            command=plan,
+            hell_mode=hell_mode,
+            expected_sessions=e_clicks,
+            expected_currency=e_cur,
+            note=note,
+            path=path,
+        )
+    e_clicks, guar = _expected_action_clicks(
+        pool, hits=hits, conjure_pool=conjure_pool
+    )
+    if e_clicks == float("inf"):
+        return None
+    from bot.core.config import CONJURE_PRICE_PREMIUM
+
+    conjure_cost = CONJURE_PRICE_PREMIUM
+    e_cur = conjure_cost + action_cost * e_clicks
+    cmd = _bot_command(source, [tag], hell_mode)
+    hit_note = f", {hits} acceptable" if hits > 1 else ""
+    if e_clicks <= 0:
+        plan = cmd
+        note = (
+            f"Roster path ({path}): conjure alone covers pool {pool}"
+            f"{hit_note} (free reroll)."
+        )
+    else:
+        plan = f"{cmd}\nthen {action_label} (~{e_clicks:.0f}× @{action_cost})"
+        cpool = conjure_pool if conjure_pool and conjure_pool > 0 else pool
+        note = (
+            f"Roster path: conjure {tag} (pool {cpool}), then {action_label} "
+            f"until any acceptable shows (filter pool {pool}{hit_note})."
+        )
+    return ConjureOption(
+        tags=tags,
+        cost=conjure_cost,
+        pool_size=pool,
+        guaranteed=guar,
+        command=plan,
+        hell_mode=hell_mode,
+        expected_sessions=1.0 + e_clicks,
+        expected_currency=e_cur,
+        note=note,
+        path=path,
+    )
+
+
+def _refine_excludes_for_targets(targets: list[TargetSnap]) -> list[str]:
+    """Exclude tags at least one target lacks (refine can still hit those)."""
+    if not targets:
+        return []
+    return [
+        ex
+        for ex in REFINE_EXCLUDE_TAGS
+        if any(ex not in t.tag_set for t in targets)
+    ]
 
 
 async def _evaluate_roster_paths(
@@ -873,15 +1145,40 @@ async def _evaluate_roster_paths(
     *,
     progress: ProgressCb | None = None,
     cancel_check: CancelCheck | None = None,
+    own_author: bool = False,
+    own_character: bool = False,
 ) -> list[ConjureOption]:
     """Conjure artist/character once, then Author / reshape / reshape_m.
 
     ``hits`` = how many any-of targets that roster filter can still reach.
+    When ``own_author`` / ``own_character`` is set, skip the 50 conjure cost
+    (user already has that roster entry).
     """
-    from bot.core.config import AUTHOR_COST, CONJURE_PRICE_PREMIUM, RESHAPE_COST
+    from bot.core.config import AUTHOR_COST, RESHAPE_COST
     from bot.utils.artist_tags import is_valid_artist_tag
 
     out: list[ConjureOption] = []
+
+    # Dominant roster tags on this target set (majority / top frequency).
+    # "Already have character/author" only discounts these, not one-off guests.
+    artist_freq: dict[str, int] = {}
+    char_freq: dict[str, int] = {}
+    for tgt in targets:
+        for a in {x.name for x in tgt.meta.artists}:
+            artist_freq[a] = artist_freq.get(a, 0) + 1
+        for c in {x.name for x in tgt.meta.characters}:
+            char_freq[c] = char_freq.get(c, 0) + 1
+    n_targets = max(len(targets), 1)
+    majority = max(1, (n_targets + 1) // 2)
+
+    def _dominant(freq: dict[str, int]) -> set[str]:
+        if not freq:
+            return set()
+        best = max(freq.values())
+        return {name for name, n in freq.items() if n >= majority or n == best}
+
+    owned_artists = _dominant(artist_freq) if own_author else set()
+    owned_characters = _dominant(char_freq) if own_character else set()
 
     def _mk(
         *,
@@ -892,43 +1189,26 @@ async def _evaluate_roster_paths(
         action_label: str,
         hits: int,
         conjure_pool: int | None = None,
+        option_tags: tuple[str, ...] | None = None,
     ) -> ConjureOption | None:
-        if pool <= 0 or hits <= 0:
-            return None
-        hits = min(hits, pool)
-        e_clicks, guar = _expected_action_clicks(
-            pool, hits=hits, conjure_pool=conjure_pool
+        owned = (path == "author" and own_author and tag in owned_artists) or (
+            path in ("reshape", "reshape_m")
+            and own_character
+            and tag in owned_characters
         )
-        if e_clicks == float("inf"):
-            return None
-        conjure_cost = CONJURE_PRICE_PREMIUM
-        e_cur = conjure_cost + action_cost * e_clicks
-        cmd = _bot_command(source, [tag], hell_mode)
-        hit_note = f", {hits} acceptable" if hits > 1 else ""
-        if e_clicks <= 0:
-            plan = cmd
-            note = (
-                f"Roster path ({path}): conjure alone covers pool {pool}"
-                f"{hit_note} (free reroll)."
-            )
-        else:
-            plan = f"{cmd}\nthen {action_label} (~{e_clicks:.0f}× @{action_cost})"
-            cpool = conjure_pool if conjure_pool and conjure_pool > 0 else pool
-            note = (
-                f"Roster path: conjure {tag} (pool {cpool}), then {action_label} "
-                f"until any acceptable shows (filter pool {pool}{hit_note})."
-            )
-        return ConjureOption(
-            tags=(tag,),
-            cost=conjure_cost,
-            pool_size=pool,
-            guaranteed=guar,
-            command=plan,
+        # Ownership check uses underlying craft (author/reshape), not "refine".
+        return _make_action_path_option(
+            source=source,
             hell_mode=hell_mode,
-            expected_sessions=1.0 + e_clicks,
-            expected_currency=e_cur,
-            note=note,
+            tag=tag,
+            pool=pool,
             path=path,
+            action_cost=action_cost,
+            action_label=action_label,
+            hits=hits,
+            conjure_pool=conjure_pool,
+            owned=owned,
+            option_tags=option_tags,
         )
 
     # --- Author paths ---
@@ -1061,6 +1341,396 @@ async def _evaluate_roster_paths(
     return out
 
 
+async def _evaluate_refine_paths(
+    source: Source,
+    hell_mode: HellMode,
+    targets: list[TargetSnap],
+    counter: _CountSession,
+    *,
+    floor: float | None = None,
+    progress: ProgressCb | None = None,
+    cancel_check: CancelCheck | None = None,
+    own_author: bool = False,
+    own_character: bool = False,
+) -> ConjureOption | None:
+    """Targeted @refine: Author/reshape with one −exclude the targets lack.
+
+    Skips ALL/mega refine (unreliable pool + many extra counts). Caps live
+    probes so this pass stays cheaper than conjure tier search.
+    """
+    from bot.core.config import AUTHOR_COST, CONJURE_PRICE_PREMIUM, RESHAPE_COST
+    from bot.utils.artist_tags import is_valid_artist_tag
+
+    excludes = _refine_excludes_for_targets(targets)
+    if not excludes:
+        return None
+
+    # Ownership: same dominant-tag rule as roster.
+    artist_freq: dict[str, int] = {}
+    char_freq: dict[str, int] = {}
+    for tgt in targets:
+        for a in {x.name for x in tgt.meta.artists}:
+            artist_freq[a] = artist_freq.get(a, 0) + 1
+        for c in {x.name for x in tgt.meta.characters}:
+            char_freq[c] = char_freq.get(c, 0) + 1
+    n_targets = max(len(targets), 1)
+    majority = max(1, (n_targets + 1) // 2)
+
+    def _dominant(freq: dict[str, int]) -> set[str]:
+        if not freq:
+            return set()
+        best = max(freq.values())
+        return {name for name, n in freq.items() if n >= majority or n == best}
+
+    owned_artists = _dominant(artist_freq) if own_author else set()
+    owned_characters = _dominant(char_freq) if own_character else set()
+
+    # Rank rarest artists / characters; only probe top anchors.
+    artist_map: dict[str, list[TargetSnap]] = {}
+    for tgt in targets:
+        for artist in tgt.meta.artists:
+            if not is_valid_artist_tag(artist.name):
+                continue
+            artist_map.setdefault(artist.name, []).append(tgt)
+    artists_ranked = sorted(
+        artist_map.items(),
+        key=lambda kv: (
+            min(
+                (a.post_count for t in kv[1] for a in t.meta.artists if a.name == kv[0]),
+                default=10_000_000,
+            ),
+            kv[0],
+        ),
+    )
+
+    def _char_count(name: str) -> int:
+        vals = [
+            c.post_count
+            for t in targets
+            for c in t.meta.characters
+            if c.name == name
+        ]
+        return min(vals) if vals else 10_000_000
+
+    char_names = sorted(
+        {c.name for t in targets for c in t.meta.characters},
+        key=lambda n: (_char_count(n), n),
+    )
+
+    # One rarest artist + one rarest character (or two of one kind if needed).
+    anchors: list[tuple[str, str, list[TargetSnap]]] = []
+    if artists_ranked:
+        name, group = artists_ranked[0]
+        anchors.append(("author", name, group))
+    if char_names:
+        name = char_names[0]
+        group = [
+            t
+            for t in targets
+            if name in t.tag_set
+            or any(c.name == name for c in t.meta.characters)
+        ]
+        anchors.append(("character", name, group))
+    # Fill remaining anchor slots with next-rarest of either kind.
+    ai = 1
+    ci = 1
+    while len(anchors) < MAX_REFINE_ANCHORS:
+        cand_a = artists_ranked[ai] if ai < len(artists_ranked) else None
+        cand_c = char_names[ci] if ci < len(char_names) else None
+        if cand_a is None and cand_c is None:
+            break
+        pick_artist = False
+        if cand_a and cand_c:
+            a_count = min(
+                (
+                    a.post_count
+                    for t in cand_a[1]
+                    for a in t.meta.artists
+                    if a.name == cand_a[0]
+                ),
+                default=10_000_000,
+            )
+            pick_artist = a_count <= _char_count(cand_c)
+        elif cand_a:
+            pick_artist = True
+        if pick_artist and cand_a:
+            anchors.append(("author", cand_a[0], cand_a[1]))
+            ai += 1
+        elif cand_c:
+            group = [
+                t
+                for t in targets
+                if cand_c in t.tag_set
+                or any(c.name == cand_c for c in t.meta.characters)
+            ]
+            anchors.append(("character", cand_c, group))
+            ci += 1
+        else:
+            break
+
+    best: ConjureOption | None = None
+    checks = 0
+
+    def _beats_floor(opt: ConjureOption) -> bool:
+        if floor is None:
+            return True
+        return opt.expected_currency < floor - 1e-9
+
+    for kind, tag_name, base_group in anchors:
+        if _cancelled(cancel_check) or checks >= MAX_REFINE_CHECKS:
+            break
+        # Conjure draws the bare tag; refine only narrows the follow-up craft.
+        conjure_pool = await counter.count_query(tag_name)
+        checks += 1
+        if conjure_pool <= 0:
+            if kind == "character":
+                counts = [
+                    c.post_count
+                    for t in base_group
+                    for c in t.meta.characters
+                    if c.name == tag_name and c.post_count < 10_000_000
+                ]
+            else:
+                counts = [
+                    a.post_count
+                    for t in base_group
+                    for a in t.meta.artists
+                    if a.name == tag_name and a.post_count < 10_000_000
+                ]
+            conjure_pool = min(counts) if counts else 0
+
+        for exclude in excludes:
+            if _cancelled(cancel_check) or checks >= MAX_REFINE_CHECKS:
+                break
+            # Targets that still match this craft after −exclude.
+            if kind == "author":
+                hit_targets = [t for t in base_group if exclude not in t.tag_set]
+                if not hit_targets:
+                    continue
+                hits = len({t.post_id for t in hit_targets})
+                if source == "danbooru":
+                    # Live bot: exclude eats solo → `{artist} -{neg}`.
+                    query = f"{tag_name} -{exclude}"
+                    craft_label = "Author"
+                else:
+                    # Live bot Author on r34 is solo + optional −exclude.
+                    query = f"{tag_name} solo -{exclude}"
+                    craft_label = "Author"
+                owned = own_author and tag_name in owned_artists
+                action_cost = AUTHOR_COST
+            else:
+                # Character refine — Danbooru drops solo (2-tag budget); r34 keeps it.
+                buckets: dict[tuple[str, str], list[TargetSnap]] = {}
+                for tgt in base_group:
+                    if exclude in tgt.tag_set:
+                        continue
+                    if source == "danbooru":
+                        # One pool per rating; solo/multi both included.
+                        buckets.setdefault(("reshape", tgt.meta.rating), []).append(tgt)
+                    else:
+                        path = "reshape" if tgt.meta.has_solo else "reshape_m"
+                        buckets.setdefault((path, tgt.meta.rating), []).append(tgt)
+                for (path, rating), group in buckets.items():
+                    if _cancelled(cancel_check) or checks >= MAX_REFINE_CHECKS:
+                        break
+                    hits = len({t.post_id for t in group})
+                    if hits <= 0:
+                        continue
+                    if source == "danbooru":
+                        query = f"{tag_name} -{exclude} rating:{rating}"
+                        craft_label = f"reshape {rating.upper()}"
+                    else:
+                        from bot.services.rule34 import rating_query_tag
+                        from bot.utils.r34_tags import (
+                            build_r34_query,
+                            build_r34_slopify_query,
+                        )
+
+                        rating_tag = rating_query_tag(rating)
+                        if path == "reshape":
+                            raw = f"solo {tag_name} {rating_tag} -{exclude}"
+                            craft_label = f"reshape {rating.upper()}"
+                        else:
+                            raw = f"{tag_name} -solo {rating_tag} -{exclude}"
+                            craft_label = f"reshape_m {rating.upper()}"
+                        query = (
+                            build_r34_slopify_query(raw)
+                            if hell_mode == "slop"
+                            else build_r34_query(raw)
+                        )
+                    # Floor prune: even a 1-click guarantee can't beat floor.
+                    owned = own_character and tag_name in owned_characters
+                    min_cur = (
+                        float(RESHAPE_COST)
+                        if owned
+                        else float(CONJURE_PRICE_PREMIUM + RESHAPE_COST)
+                    )
+                    if floor is not None and min_cur >= floor - 1e-9:
+                        continue
+                    _progress(
+                        progress,
+                        f"Refine −{exclude}: {craft_label} via {tag_name}…",
+                    )
+                    pool = await counter.count_query(query)
+                    checks += 1
+                    if pool <= 0:
+                        continue
+                    label = f"refine −{exclude} → {craft_label}"
+                    opt = _make_action_path_option(
+                        source=source,
+                        hell_mode=hell_mode,
+                        tag=tag_name,
+                        pool=pool,
+                        path="refine",
+                        action_cost=RESHAPE_COST,
+                        action_label=label,
+                        hits=hits,
+                        conjure_pool=conjure_pool,
+                        owned=owned,
+                        option_tags=(tag_name, exclude),
+                    )
+                    if opt and _beats_floor(opt):
+                        best = _better_option(best, opt)
+                        if (
+                            best
+                            and best.guaranteed
+                            and best.expected_currency
+                            <= (0 if owned else CONJURE_PRICE_PREMIUM) + RESHAPE_COST + 1e-9
+                        ):
+                            return best
+                continue  # author branch handled below; character done via buckets
+
+            # Author branch (single query per exclude).
+            min_cur = (
+                float(AUTHOR_COST)
+                if owned
+                else float(CONJURE_PRICE_PREMIUM + AUTHOR_COST)
+            )
+            if floor is not None and min_cur >= floor - 1e-9:
+                continue
+            _progress(
+                progress,
+                f"Refine −{exclude}: Author via {tag_name}…",
+            )
+            pool = await counter.count_query(query)
+            checks += 1
+            if pool <= 0:
+                continue
+            label = f"refine −{exclude} → {craft_label}"
+            opt = _make_action_path_option(
+                source=source,
+                hell_mode=hell_mode,
+                tag=tag_name,
+                pool=pool,
+                path="refine",
+                action_cost=action_cost,
+                action_label=label,
+                hits=hits,
+                conjure_pool=conjure_pool,
+                owned=owned,
+                option_tags=(tag_name, exclude),
+            )
+            if opt and _beats_floor(opt):
+                best = _better_option(best, opt)
+                if best and best.guaranteed and best.expected_currency <= min_cur + 1e-9:
+                    return best
+
+    return best
+
+
+async def _evaluate_beckon_paths(
+    source: Source,
+    hell_mode: HellMode,
+    targets: list[TargetSnap],
+    priced: list[PricedTag],
+    counter: _CountSession,
+    *,
+    floor: float | None = None,
+    progress: ProgressCb | None = None,
+    cancel_check: CancelCheck | None = None,
+) -> ConjureOption | None:
+    """Single category-0 general tag beckon — up to 10 peeks, fixed cost.
+
+    Bot has no /beckon_hell_slop; hell draws always −ai_generated, so skip AI posts.
+    """
+    if hell_mode == "slop":
+        return None
+    candidates = [
+        t
+        for t in priced
+        if _is_beckonable(t) and _hits_for_tags(targets, [t.name]) > 0
+    ]
+    candidates.sort(key=lambda t: (t.post_count, t.name))
+    candidates = candidates[:MAX_BECKON_CHECKS]
+    if not candidates:
+        return None
+
+    best: ConjureOption | None = None
+    for tag in candidates:
+        if _cancelled(cancel_check):
+            break
+        hits = _hits_for_tags(targets, [tag.name])
+        if hits <= 0:
+            continue
+        # Optimistic skip from metadata before burning a live count.
+        est = tag.post_count if tag.post_count > 0 else 10_000_000
+        if est >= 100:
+            est = 100
+        est_sessions = _expected_beckon_sessions(est, hits=min(hits, est))
+        if floor is not None and BECKON_PRICE * est_sessions >= floor - 1e-9:
+            # Rarer tags come first; once metadata can't beat floor, stop.
+            if est > BECKON_PEEKS:
+                break
+            continue
+        _progress(progress, f"Checking beckon: {tag.name}…")
+        pool = await counter([tag.name])
+        if pool >= 100:
+            pool = 100
+        if pool <= 0:
+            continue
+        hits = min(hits, pool)
+        sessions = _expected_beckon_sessions(pool, hits=hits)
+        e_cur = BECKON_PRICE * sessions
+        if floor is not None and e_cur >= floor - 1e-9:
+            if best is not None and e_cur >= best.expected_currency - 1e-9:
+                continue
+        guaranteed = pool <= BECKON_PEEKS
+        hit_note = f" ({hits} acceptable)" if hits > 1 else ""
+        option = ConjureOption(
+            tags=(tag.name,),
+            cost=BECKON_PRICE,
+            pool_size=pool,
+            guaranteed=guaranteed,
+            command=_beckon_command(source, tag.name, hell_mode),
+            hell_mode=hell_mode,
+            expected_sessions=sessions,
+            expected_currency=e_cur,
+            note=(
+                f"Beckon guarantee: up to {BECKON_PEEKS} peeks cover the whole pool."
+                if guaranteed
+                else (
+                    f"~{sessions:.1f} beckon sessions expected{hit_note} "
+                    f"(keep excludes one miss; shown-but-not-kept can reappear)."
+                )
+            ),
+            path="beckon",
+        )
+        prev = best
+        best = _better_option(best, option)
+        if best is not prev:
+            _progress(
+                progress,
+                f"Best beckon: {tag.name} — pool {pool}{hit_note}, "
+                f"~{option.expected_currency:.0f} currency expected.",
+            )
+        if guaranteed and (floor is None or e_cur < floor - 1e-9):
+            # Cheapest beckon guarantee is always BECKON_PRICE; rarer tags first.
+            break
+        if floor is None or (best and best.expected_currency < floor):
+            floor = best.expected_currency if best else floor
+    return best
+
+
 def _merge_priced(targets: list[TargetSnap]) -> list[PricedTag]:
     """Union of tags; keep rarest count and first-seen category/price."""
     best: dict[str, PricedTag] = {}
@@ -1087,16 +1757,21 @@ async def _load_target(
     parsed: ParsedPostUrl,
     progress: ProgressCb | None,
     cancel_check: CancelCheck | None,
+    *,
+    danbooru_client=None,
 ) -> TargetSnap:
     if parsed.source == "danbooru":
         _progress(progress, f"Loading Danbooru post #{parsed.post_id}…")
-        priced, file_ext, warnings, meta = await _load_danbooru_tags(
-            parsed.post_id, progress, cancel_check
+        priced, file_ext, warnings, meta, preview_url = await _load_danbooru_tags(
+            parsed.post_id,
+            progress,
+            cancel_check,
+            client=danbooru_client,
         )
         hell_mode: HellMode = ""
     else:
         _progress(progress, f"Loading Rule34 post #{parsed.post_id}…")
-        priced, file_ext, warnings, hell_mode, meta = await _load_rule34_tags(
+        priced, file_ext, warnings, hell_mode, meta, preview_url = await _load_rule34_tags(
             parsed.post_id, progress, cancel_check
         )
     if not priced:
@@ -1109,6 +1784,8 @@ async def _load_target(
         meta=meta,
         hell_mode=hell_mode,
         warnings=list(warnings),
+        preview_url=preview_url,
+        page_url=post_page_url(parsed.source, parsed.post_id),
     )
 
 
@@ -1140,12 +1817,16 @@ async def _search_targets(
         tags_on_post=len(priced),
     )
 
-    # Fast path: cheap single-tag guarantee that covers ≥1 target.
+    # Fast path: cheap single-tag conjure guarantee that covers ≥1 target.
+    # Only early-exit when cost beats beckon (general 25 < 30); premium solo
+    # guarantees still compete with beckon in the full search.
     # Always live-count — metadata pool≤2 can be stale (false guarantee).
     solo_hits = [t for t in priced if 0 < t.post_count <= GUARANTEE_POOL_MAX]
     if solo_hits:
         solo_hits.sort(key=lambda t: (t.price, t.post_count, t.name))
         for pick in solo_hits:
+            if pick.price >= BECKON_PRICE:
+                continue
             if _hits_for_tags(targets, [pick.name]) <= 0:
                 continue
             _progress(progress, f"Verifying solo guarantee: {pick.name}…")
@@ -1184,6 +1865,8 @@ async def _search_targets(
     counter = _CountSession(source, hell_mode)
     await counter.start()
     roster_best: ConjureOption | None = None
+    beckon_best: ConjureOption | None = None
+    conjure_best: ConjureOption | None = None
     try:
         _progress(progress, "Checking Author / reshape roster paths…")
         roster_opts = await _evaluate_roster_paths(
@@ -1204,6 +1887,53 @@ async def _search_targets(
                 f"(pool {roster_best.pool_size}).",
             )
 
+        # Targeted refine after plain roster — floor prune keeps it cheap.
+        floor_for_refine = (
+            roster_best.expected_currency if roster_best is not None else None
+        )
+        _progress(progress, "Checking refine paths (−exclude crafts)…")
+        refine_best = await _evaluate_refine_paths(
+            source,
+            hell_mode,
+            targets,
+            counter,
+            floor=floor_for_refine,
+            progress=progress,
+            cancel_check=cancel_check,
+        )
+        if refine_best:
+            result.checked += 1
+            roster_best = _better_option(roster_best, refine_best)
+            _progress(
+                progress,
+                f"Best refine: {' '.join(refine_best.tags)} — "
+                f"~{refine_best.expected_currency:.0f} cur "
+                f"(pool {refine_best.pool_size}).",
+            )
+
+        floor_for_beckon = (
+            roster_best.expected_currency if roster_best is not None else None
+        )
+        _progress(progress, "Checking beckon paths (sparse general tags)…")
+        beckon_best = await _evaluate_beckon_paths(
+            source,
+            hell_mode,
+            targets,
+            priced,
+            counter,
+            floor=floor_for_beckon,
+            progress=progress,
+            cancel_check=cancel_check,
+        )
+        if beckon_best:
+            result.checked += 1
+            _progress(
+                progress,
+                f"Best beckon: {' '.join(beckon_best.tags)} — "
+                f"~{beckon_best.expected_currency:.0f} cur "
+                f"(pool {beckon_best.pool_size}).",
+            )
+
         candidates, deferred_singles = _iter_candidates(priced)
         _progress(
             progress,
@@ -1212,6 +1942,7 @@ async def _search_targets(
         )
 
         best_non_guarantee: ConjureOption | None = None
+        failed_count_probes = 0
         tiers: list[tuple[int, list[tuple[int, list[PricedTag]]]]] = []
         for cost, _est, tag_objs in candidates:
             if tiers and tiers[-1][0] == cost:
@@ -1221,21 +1952,104 @@ async def _search_targets(
 
         sem = asyncio.Semaphore(8 if source == "danbooru" else 3)
 
+        def _floor_opt() -> ConjureOption | None:
+            return _better_option(
+                _better_option(best_non_guarantee, roster_best), beckon_best
+            )
+
+        def _option_from_probe(
+            tag_objs: list[PricedTag],
+            cost: int,
+            pool: int,
+            hits: int,
+        ) -> ConjureOption:
+            hits = min(hits, pool)
+            names = [t.name for t in tag_objs]
+            guaranteed = pool <= GUARANTEE_POOL_MAX
+            sessions = _expected_sessions(pool, hits=hits)
+            hit_note = f" ({hits} acceptable)" if hits > 1 else ""
+            return ConjureOption(
+                tags=tuple(names),
+                cost=cost,
+                pool_size=pool,
+                guaranteed=guaranteed,
+                command=_bot_command(source, names, hell_mode),
+                hell_mode=hell_mode,
+                expected_sessions=sessions,
+                expected_currency=cost * sessions,
+                note=(
+                    "Guarantee: 1 conjure + free reroll covers the whole pool."
+                    if guaranteed
+                    else (
+                        f"~{sessions:.1f} conjure sessions expected"
+                        f"{hit_note} (free reroll + same-tag pity)."
+                    )
+                ),
+                path="conjure",
+            )
+
+        def _consider(
+            option: ConjureOption,
+            *,
+            guarantee: ConjureOption | None,
+        ) -> ConjureOption | None:
+            nonlocal best_non_guarantee
+            label = " ".join(option.tags)
+            if option.guaranteed:
+                if guarantee is None or (
+                    option.pool_size,
+                    option.expected_currency,
+                    option.tags,
+                ) < (
+                    guarantee.pool_size,
+                    guarantee.expected_currency,
+                    guarantee.tags,
+                ):
+                    guarantee = option
+                    _progress(
+                        progress,
+                        f"Found guarantee: {label} (pool={option.pool_size}, "
+                        f"cost={option.cost}). Stopping this tier.",
+                    )
+                return guarantee
+            if (
+                best_non_guarantee is None
+                or option.expected_currency
+                < best_non_guarantee.expected_currency - 1e-9
+                or (
+                    abs(
+                        option.expected_currency
+                        - best_non_guarantee.expected_currency
+                    )
+                    < 1e-9
+                    and (
+                        option.pool_size < best_non_guarantee.pool_size
+                        or (
+                            option.pool_size == best_non_guarantee.pool_size
+                            and option.expected_sessions
+                            < best_non_guarantee.expected_sessions
+                        )
+                    )
+                )
+            ):
+                best_non_guarantee = option
+                _progress(
+                    progress,
+                    f"Best so far: {label} — pool {option.pool_size}, "
+                    f"~{option.expected_currency:.0f} currency expected.",
+                )
+            return guarantee
+
         async def _probe(
             cost: int, est: int, tag_objs: list[PricedTag]
         ) -> tuple[list[PricedTag], int, int, int, int]:
-            """Return (tags, cost, est, pool, hits). pool -2 = dominated skip."""
+            """Return (tags, cost, est, pool, hits). pool <0 = sentinel."""
             names = [t.name for t in tag_objs]
             hits = _hits_for_tags(targets, names)
             if hits <= 0:
-                return tag_objs, cost, est, -2, 0
-            floor = None
-            if best_non_guarantee is not None:
-                floor = best_non_guarantee.expected_currency
-            if roster_best is not None and (
-                floor is None or roster_best.expected_currency < floor
-            ):
-                floor = roster_best.expected_currency
+                return tag_objs, cost, est, _POOL_SKIP, 0
+            floor_opt = _floor_opt()
+            floor = floor_opt.expected_currency if floor_opt is not None else None
             # Skip only when even a live pool≤2 guarantee cannot beat floor.
             # Never trust metadata est here — inflated counts skipped real
             # small pools under the old cost*E[sessions(est)] check.
@@ -1245,16 +2059,17 @@ async def _search_targets(
                 and est > GUARANTEE_POOL_MAX
                 and cost >= floor - 1e-9
             ):
-                return tag_objs, cost, est, -2, hits
+                return tag_objs, cost, est, _POOL_SKIP, hits
             async with sem:
                 if _cancelled(cancel_check):
-                    return tag_objs, cost, est, -1, hits
+                    return tag_objs, cost, est, _POOL_CANCELLED, hits
                 pool = await counter(names)
+                if pool < 0:
+                    return tag_objs, cost, est, _POOL_FAILED, hits
                 if pool >= 100:
                     pool = 100
                 return tag_objs, cost, est, pool, hits
 
-        conjure_best: ConjureOption | None = None
         for cost, rows in tiers:
             if _cancelled(cancel_check):
                 result.warnings.append("Search cancelled.")
@@ -1262,7 +2077,7 @@ async def _search_targets(
             # Skip only when even a live pool≤2 guarantee at this cost cannot
             # beat the current floor. Equal expected currency still matters:
             # a cost-75 guarantee beats a cost-50 pool-4 (~75 cur) non-guarantee.
-            floor_opt = _better_option(best_non_guarantee, roster_best)
+            floor_opt = _floor_opt()
             if not _conjure_guarantee_beats(cost, floor_opt):
                 beat = floor_opt.expected_currency if floor_opt else cost
                 _progress(
@@ -1280,58 +2095,47 @@ async def _search_targets(
                 for est, tag_objs in rows
             ]
             guarantee: ConjureOption | None = None
+            failed_rows: list[tuple[int, list[PricedTag]]] = []
+            tier_done = 0
+            tier_total = len(pending)
             try:
                 for fut in asyncio.as_completed(pending):
                     try:
                         tag_objs, _cost, _est, pool, hits = await fut
                     except asyncio.CancelledError:
                         continue
-                    if pool == -2:
+                    tier_done += 1
+                    if (
+                        tier_done == 1
+                        or tier_done == tier_total
+                        or tier_done % 5 == 0
+                    ):
+                        floor_now = _floor_opt()
+                        best_bit = (
+                            f", best ~{floor_now.expected_currency:.0f} cur"
+                            if floor_now is not None
+                            else ""
+                        )
+                        _progress(
+                            progress,
+                            f"Cost {cost}: {tier_done}/{tier_total} combos"
+                            f"{best_bit}…",
+                        )
+                    if pool == _POOL_SKIP:
+                        continue
+                    if pool == _POOL_FAILED:
+                        failed_count_probes += 1
+                        failed_rows.append((_est, tag_objs))
+                        continue
+                    if pool == _POOL_CANCELLED:
                         continue
                     result.checked += 1
                     if pool <= 0 or hits <= 0:
                         continue
-                    hits = min(hits, pool)
-                    names = [t.name for t in tag_objs]
-                    label = " ".join(names)
-                    guaranteed = pool <= GUARANTEE_POOL_MAX
-                    sessions = _expected_sessions(pool, hits=hits)
-                    hit_note = f" ({hits} acceptable)" if hits > 1 else ""
-                    option = ConjureOption(
-                        tags=tuple(names),
-                        cost=cost,
-                        pool_size=pool,
-                        guaranteed=guaranteed,
-                        command=_bot_command(source, names, hell_mode),
-                        hell_mode=hell_mode,
-                        expected_sessions=sessions,
-                        expected_currency=cost * sessions,
-                        note=(
-                            "Guarantee: 1 conjure + free reroll covers the whole pool."
-                            if guaranteed
-                            else (
-                                f"~{sessions:.1f} conjure sessions expected"
-                                f"{hit_note} (free reroll + same-tag pity)."
-                            )
-                        ),
-                        path="conjure",
-                    )
-                    if guaranteed:
-                        if guarantee is None or (
-                            option.pool_size,
-                            option.expected_currency,
-                            option.tags,
-                        ) < (
-                            guarantee.pool_size,
-                            guarantee.expected_currency,
-                            guarantee.tags,
-                        ):
-                            guarantee = option
-                            _progress(
-                                progress,
-                                f"Found guarantee: {label} (pool={pool}, "
-                                f"cost={cost}). Stopping this tier.",
-                            )
+                    option = _option_from_probe(tag_objs, cost, pool, hits)
+                    prev = guarantee
+                    guarantee = _consider(option, guarantee=guarantee)
+                    if guarantee is not None and prev is None:
                         # Cancel rest of this cost tier. Do NOT do this for
                         # non-guarantees (pool 3) — that race missed cheaper
                         # pool≤2 paths still in flight.
@@ -1339,37 +2143,51 @@ async def _search_targets(
                             if not p.done():
                                 p.cancel()
                         break
-                    if (
-                        best_non_guarantee is None
-                        or option.expected_currency
-                        < best_non_guarantee.expected_currency - 1e-9
-                        or (
-                            abs(
-                                option.expected_currency
-                                - best_non_guarantee.expected_currency
-                            )
-                            < 1e-9
-                            and (
-                                option.pool_size < best_non_guarantee.pool_size
-                                or (
-                                    option.pool_size == best_non_guarantee.pool_size
-                                    and option.expected_sessions
-                                    < best_non_guarantee.expected_sessions
-                                )
-                            )
-                        )
-                    ):
-                        best_non_guarantee = option
-                        _progress(
-                            progress,
-                            f"Best so far: {label} — pool {pool}{hit_note}, "
-                            f"~{option.expected_currency:.0f} currency expected.",
-                        )
             finally:
                 for p in pending:
                     if not p.done():
                         p.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
+
+            # Flaky Danbooru counts used to return -1 and be skipped — that
+            # left runner-ups like skin_fang+solipsist while bent_over+artist
+            # (pool 1) never landed. Retry failures once before leaving the tier.
+            if (
+                guarantee is None
+                and failed_rows
+                and not _cancelled(cancel_check)
+            ):
+                _progress(
+                    progress,
+                    f"Retrying {len(failed_rows)} failed pool count(s) "
+                    f"at cost {cost}…",
+                )
+                for est, tag_objs in failed_rows:
+                    if _cancelled(cancel_check):
+                        break
+                    tag_objs, _cost, _est, pool, hits = await _probe(
+                        cost, est, tag_objs
+                    )
+                    if pool == _POOL_FAILED:
+                        # One more serial attempt outside the busy semaphore.
+                        names = [t.name for t in tag_objs]
+                        await asyncio.sleep(0.5)
+                        if _cancelled(cancel_check):
+                            break
+                        pool = await counter(names)
+                        if pool < 0:
+                            continue
+                        if pool >= 100:
+                            pool = 100
+                    elif pool in (_POOL_SKIP, _POOL_CANCELLED) or pool <= 0:
+                        continue
+                    if hits <= 0:
+                        continue
+                    result.checked += 1
+                    option = _option_from_probe(tag_objs, cost, pool, hits)
+                    guarantee = _consider(option, guarantee=guarantee)
+                    if guarantee is not None:
+                        break
 
             if guarantee is not None:
                 conjure_best = _better_option(guarantee, best_non_guarantee)
@@ -1382,19 +2200,21 @@ async def _search_targets(
         else:
             conjure_best = best_non_guarantee
 
+        if failed_count_probes and not (
+            conjure_best is not None and conjure_best.guaranteed
+        ):
+            result.warnings.append(
+                f"{failed_count_probes} pool count(s) failed during search; "
+                "result may be suboptimal — retry if this looks wrong."
+            )
+
         # Deferred large singles: only those that could still beat current best.
-        floor_cur = None
-        if conjure_best is not None:
+        floor_opt = _floor_opt()
+        floor_cur = floor_opt.expected_currency if floor_opt is not None else None
+        if conjure_best is not None and (
+            floor_cur is None or conjure_best.expected_currency < floor_cur
+        ):
             floor_cur = conjure_best.expected_currency
-        if best_non_guarantee is not None and (
-            floor_cur is None
-            or best_non_guarantee.expected_currency < floor_cur
-        ):
-            floor_cur = best_non_guarantee.expected_currency
-        if roster_best is not None and (
-            floor_cur is None or roster_best.expected_currency < floor_cur
-        ):
-            floor_cur = roster_best.expected_currency
         worth = [
             (c, e, t)
             for c, e, t in deferred_singles
@@ -1412,16 +2232,28 @@ async def _search_targets(
             pending = [
                 asyncio.create_task(_probe(c, e, t)) for c, e, t in worth
             ]
+            deferred_done = 0
+            deferred_total = len(pending)
             try:
                 for fut in asyncio.as_completed(pending):
                     try:
                         tag_objs, cost, _est, pool, hits = await fut
                     except asyncio.CancelledError:
                         continue
-                    if pool == -2:
+                    deferred_done += 1
+                    if (
+                        deferred_done == 1
+                        or deferred_done == deferred_total
+                        or deferred_done % 5 == 0
+                    ):
+                        _progress(
+                            progress,
+                            f"Deferred singles: {deferred_done}/{deferred_total}…",
+                        )
+                    if pool == _POOL_SKIP:
                         continue
                     result.checked += 1
-                    if pool <= 0 or hits <= 0:
+                    if pool == _POOL_FAILED or pool == _POOL_CANCELLED or pool <= 0 or hits <= 0:
                         continue
                     hits = min(hits, pool)
                     names = [t.name for t in tag_objs]
@@ -1473,12 +2305,22 @@ async def _search_targets(
     finally:
         await counter.aclose()
 
-    result.best = _better_option(conjure_best, roster_best)
+    result.best = _better_option(
+        _better_option(conjure_best, roster_best), beckon_best
+    )
     if result.best is None:
         result.warnings.append("No matching tag combination returned any posts.")
     else:
         result.guaranteed = result.best.guaranteed
-        if result.best.path != "conjure":
+        if result.best.path == "beckon":
+            result.warnings.append(
+                "Cheapest route is /beckon (sparse general tag), not pure conjure."
+            )
+        elif result.best.path == "refine":
+            result.warnings.append(
+                "Cheapest route is @refine (roster craft with −exclude), not pure conjure."
+            )
+        elif result.best.path != "conjure":
             result.warnings.append(
                 f"Cheapest route is roster path ({result.best.path}), not pure conjure."
             )
@@ -1498,8 +2340,13 @@ async def _search_targets(
                 f"Picked roster path over conjure "
                 f"(~{getattr(conjure_best, 'expected_currency', float('inf')):.0f} cur).",
             )
+        elif beckon_best and result.best is beckon_best:
+            _progress(
+                progress,
+                f"Picked beckon over conjure/roster "
+                f"(~{getattr(conjure_best, 'expected_currency', float('inf')):.0f} cur conjure).",
+            )
     return result
-
 
 async def find_cheapest_conjure(
     url: str,

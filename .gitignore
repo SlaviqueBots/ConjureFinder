@@ -3,6 +3,13 @@
 conjure_finder.env
 *.env
 !conjure_finder.env.example
+sparse_tags_favourites.json
+sparse_tags_prefs.json
+sparse_tags_seen.json
+sparse_tags_combo.json
+sparse_tags_data_root.txt
+conjure_finder_saves/
+conjure_finder_preview_cache/
 
 # Python
 venv/
@@ -27,6 +34,7 @@ htmlcov/
 releases/*.exe
 releases/*.exe.sha256
 releases/version.json
+releases/sparse_tags/
 !releases/.gitkeep
 
 # PyInstaller / frozen leftovers
@@ -48,3 +56,9 @@ _diag_*.txt
 *.swp
 Thumbs.db
 Desktop.ini
+
+# owner-local runtime data
+sparse_tags/prefs.py
+sparse_tags/history.py
+sparse_tags/favourites.py
+_sparse_shot.bmp

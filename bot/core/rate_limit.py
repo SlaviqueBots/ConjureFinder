@@ -11,8 +11,9 @@ class DanbooruRateLimiter:
     """Throttle Danbooru; backs off automatically under burst load."""
 
     def __init__(self, min_interval: float = DANBOORU_MIN_INTERVAL_SEC) -> None:
-        self._lock = asyncio.Lock()
-        self._dedup_lock = asyncio.Lock()
+        self._lock: asyncio.Lock | None = None
+        self._dedup_lock: asyncio.Lock | None = None
+        self._lock_loop: asyncio.AbstractEventLoop | None = None
         self._last = 0.0
         self._base_interval = min_interval
         self._min_interval = min_interval
@@ -22,6 +23,15 @@ class DanbooruRateLimiter:
         self._burst_soft = 18
         self._burst_hard = 30
         self._max_interval = 2.5
+
+    def _ensure_locks(self) -> None:
+        """Locks must belong to the current event loop (fresh each asyncio.run)."""
+        loop = asyncio.get_running_loop()
+        if self._lock is None or self._lock_loop is not loop:
+            self._lock = asyncio.Lock()
+            self._dedup_lock = asyncio.Lock()
+            self._lock_loop = loop
+            self._inflight.clear()
 
     def _prune_window(self, now: float) -> None:
         cutoff = now - self._window_sec
@@ -41,6 +51,8 @@ class DanbooruRateLimiter:
         self._min_interval = min(self._max_interval, max(self._min_interval, retry_after))
 
     async def acquire(self) -> None:
+        self._ensure_locks()
+        assert self._lock is not None
         async with self._lock:
             now = time.time()
             self._prune_window(now)
@@ -52,6 +64,8 @@ class DanbooruRateLimiter:
             self._window.append(self._last)
 
     async def dedup(self, key: str, coro_factory):
+        self._ensure_locks()
+        assert self._dedup_lock is not None
         async with self._dedup_lock:
             existing = self._inflight.get(key)
             if existing is not None:

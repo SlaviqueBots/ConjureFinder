@@ -248,6 +248,64 @@ async def test_reshape_small_filter_does_not_block_conjure_guarantee(
 
 
 @pytest.mark.asyncio
+async def test_failed_pool_count_is_retried_for_guarantee(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transient -1 on bent_over+solipsist must not stick on skin_fang runner-up."""
+    priced = [
+        _tag("skin_fang", price=25, count=4_000),
+        _tag("bent_over", price=25, count=50_000),
+        _tag("noise_g", price=25, count=3_000),
+        _tag("solipsist", price=50, count=200, category=1),
+    ]
+    pools = {
+        frozenset({"skin_fang", "solipsist"}): 4,
+        frozenset({"bent_over", "solipsist"}): 1,
+        frozenset({"noise_g", "solipsist"}): 20,
+        frozenset({"bent_over", "skin_fang"}): 80,
+        frozenset({"bent_over", "noise_g"}): 90,
+        frozenset({"skin_fang", "noise_g"}): 50,
+    }
+    fail_once = {frozenset({"bent_over", "solipsist"})}
+
+    class FlakyCountSession(FakeCountSession):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._fails_left = {k: 1 for k in fail_once}
+
+        async def __call__(self, tags: list[str]) -> int:
+            key = frozenset(tags)
+            self.probed.append(key)
+            if self._fails_left.get(key, 0) > 0:
+                self._fails_left[key] -= 1
+                return -1
+            if key in self.pools:
+                return self.pools[key]
+            return 50
+
+    created: list[FlakyCountSession] = []
+
+    def factory(source: str, hell_mode: str) -> FlakyCountSession:
+        fake = FlakyCountSession(source, hell_mode, pools)
+        created.append(fake)
+        return fake
+
+    monkeypatch.setattr("conjure_finder.engine._CountSession", factory)
+    result = await _search_targets("danbooru", [_target(priced)], "")
+    assert result.best is not None
+    assert result.best.guaranteed is True
+    assert result.best.cost == 75
+    assert set(result.best.tags) == {"bent_over", "solipsist"}
+    bent_probes = sum(
+        1
+        for fake in created
+        for k in fake.probed
+        if k == frozenset({"bent_over", "solipsist"})
+    )
+    assert bent_probes >= 2
+
+
+@pytest.mark.asyncio
 async def test_equal_expected_currency_still_probes_guarantee_tier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -274,3 +332,201 @@ async def test_equal_expected_currency_still_probes_guarantee_tier(
     assert set(result.best.tags) == {"bent_over", "solipsist"}
     probed = {k for fake in created for k in fake.probed}
     assert frozenset({"bent_over", "solipsist"}) in probed
+
+
+@pytest.mark.asyncio
+async def test_beckon_sparse_general_beats_conjure_expected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pool-5 general: beckon @30 beats conjure @25 with ~1.67 sessions (~41 cur)."""
+    priced = [
+        _tag("sparse_pose", price=25, count=5),
+        _tag("common_a", price=25, count=8_000),
+        _tag("common_b", price=25, count=9_000),
+    ]
+    pools = {
+        frozenset({"sparse_pose"}): 5,
+        frozenset({"common_a"}): 80,
+        frozenset({"common_b"}): 90,
+        frozenset({"sparse_pose", "common_a"}): 5,
+        frozenset({"sparse_pose", "common_b"}): 5,
+        frozenset({"common_a", "common_b"}): 40,
+    }
+    _patch_counter(monkeypatch, pools)
+    result = await _search_targets("danbooru", [_target(priced)], "")
+    assert result.best is not None
+    assert result.best.path == "beckon"
+    assert result.best.guaranteed is True
+    assert result.best.cost == 30
+    assert result.best.tags == ("sparse_pose",)
+    assert result.best.command == "/beckon sparse_pose"
+
+
+@pytest.mark.asyncio
+async def test_beckon_skipped_when_conjure_solo_cheaper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pool≤2 general at cost 25 still wins over beckon at 30."""
+    priced = [
+        _tag("ultra_rare", price=25, count=2),
+        _tag("also_sparse", price=25, count=8),
+    ]
+    pools = {
+        frozenset({"ultra_rare"}): 2,
+        frozenset({"also_sparse"}): 8,
+    }
+    _patch_counter(monkeypatch, pools)
+    result = await _search_targets("danbooru", [_target(priced)], "")
+    assert result.best is not None
+    assert result.best.path == "conjure"
+    assert result.best.cost == 25
+    assert result.best.tags == ("ultra_rare",)
+
+
+@pytest.mark.asyncio
+async def test_beckon_rejects_character_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Character-only sparse tag must not become a beckon path."""
+    priced = [
+        _tag("rare_char", price=50, count=4, category=4),
+        _tag("wide_general", price=25, count=50_000),
+    ]
+    pools = {
+        frozenset({"rare_char"}): 4,
+        frozenset({"wide_general"}): 100,
+        frozenset({"rare_char", "wide_general"}): 4,
+    }
+    _patch_counter(monkeypatch, pools)
+    result = await _search_targets("danbooru", [_target(priced)], "")
+    assert result.best is not None
+    assert result.best.path != "beckon"
+    assert "rare_char" in result.best.tags or result.best.path in (
+        "conjure",
+        "reshape",
+        "reshape_m",
+        "author",
+    )
+
+
+@pytest.mark.asyncio
+async def test_refine_beats_wide_reshape_when_exclude_shrinks_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Targeted refine (−greyscale) should beat a huge plain reshape pool."""
+    priced = [
+        _tag("wide_general", price=25, count=80_000),
+        _tag("some_artist", price=50, count=40_000, category=1),
+        _tag("rare_char_(series)", price=50, count=20_000, category=4),
+    ]
+    target = _target(priced, rating="e", has_solo=True)
+    assert "greyscale" not in target.tag_set
+
+    query_pools = {
+        "rare_char_(series)": 20_000,
+        "some_artist": 40_000,
+        "solo rare_char_(series) rating:e": 8_000,
+        "rare_char_(series) -greyscale rating:e": 2,
+        "rare_char_(series) -simple_background rating:e": 7_500,
+        "some_artist -greyscale": 30_000,
+    }
+    _patch_counter(
+        monkeypatch,
+        {
+            frozenset({"wide_general"}): 100,
+            frozenset({"some_artist"}): 100,
+            frozenset({"rare_char_(series)"}): 100,
+            frozenset({"wide_general", "some_artist"}): 100,
+            frozenset({"wide_general", "rare_char_(series)"}): 100,
+        },
+        query_pools=query_pools,
+    )
+    result = await _search_targets("danbooru", [target], "")
+    assert result.best is not None
+    assert result.best.path == "refine"
+    assert result.best.tags == ("rare_char_(series)", "greyscale")
+    assert "refine −greyscale" in result.best.command
+
+
+@pytest.mark.asyncio
+async def test_refine_skipped_when_target_has_all_exclude_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the post already carries every refine trash tag, skip the pass."""
+    from conjure_finder.engine import REFINE_EXCLUDE_TAGS, _refine_excludes_for_targets
+
+    priced = [
+        _tag("rare_char_(series)", price=50, count=100, category=4),
+        *[_tag(ex, price=25, count=1_000_000) for ex in REFINE_EXCLUDE_TAGS],
+    ]
+    target = _target(priced, rating="e", has_solo=True)
+    assert _refine_excludes_for_targets([target]) == []
+    _patch_counter(
+        monkeypatch,
+        {frozenset({"rare_char_(series)"}): 2},
+        query_pools={"rare_char_(series)": 2, "solo rare_char_(series) rating:e": 2},
+    )
+    result = await _search_targets("danbooru", [target], "")
+    assert result.best is not None
+    assert result.best.path != "refine"
+
+
+@pytest.mark.asyncio
+async def test_beckon_rejects_meta_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bot validate_general is category 0 only — meta (5) is not beckonable."""
+    priced = [
+        _tag("rare_meta", price=25, count=4, category=5),
+        _tag("wide_general", price=25, count=50_000),
+    ]
+    pools = {
+        frozenset({"rare_meta"}): 4,
+        frozenset({"wide_general"}): 100,
+        frozenset({"rare_meta", "wide_general"}): 4,
+    }
+    _patch_counter(monkeypatch, pools)
+    result = await _search_targets("danbooru", [_target(priced)], "")
+    assert result.best is not None
+    assert result.best.path != "beckon"
+    assert result.best.tags != ("rare_meta",) or result.best.path == "conjure"
+
+
+@pytest.mark.asyncio
+async def test_beckon_rejects_cosplay_tags(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bot validate_general refuses *(cosplay) even when category is general."""
+    priced = [
+        _tag("asuna_(sao)_(cosplay)", price=50, count=3, category=0),
+        _tag("wide_general", price=25, count=50_000),
+    ]
+    pools = {
+        frozenset({"asuna_(sao)_(cosplay)"}): 3,
+        frozenset({"wide_general"}): 100,
+        frozenset({"asuna_(sao)_(cosplay)", "wide_general"}): 3,
+    }
+    _patch_counter(monkeypatch, pools)
+    result = await _search_targets("danbooru", [_target(priced)], "")
+    assert result.best is not None
+    assert result.best.path != "beckon"
+    assert result.best.tags != ("asuna_(sao)_(cosplay)",) or result.best.path == "conjure"
+
+
+@pytest.mark.asyncio
+async def test_beckon_skipped_for_rule34_slop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No /beckon_hell_slop — AI posts must not get a beckon recommendation."""
+    priced = [
+        _tag("sparse_pose", price=25, count=5),
+        _tag("common_a", price=25, count=8_000),
+    ]
+    pools = {
+        frozenset({"sparse_pose"}): 5,
+        frozenset({"common_a"}): 80,
+        frozenset({"sparse_pose", "common_a"}): 5,
+    }
+    _patch_counter(monkeypatch, pools)
+    result = await _search_targets("rule34", [_target(priced)], "slop")
+    assert result.best is None or result.best.path != "beckon"

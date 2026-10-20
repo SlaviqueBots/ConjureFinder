@@ -58,6 +58,20 @@ def split_url_jobs(raw: str) -> list[list[str]]:
     return jobs
 
 
+def flatten_wishlist_urls(raw: str) -> list[str]:
+    """All URL tokens from pasted text as one flat wishlist (order preserved, deduped)."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for job in split_url_jobs(raw):
+        for url in job:
+            key = url.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(url)
+    return out
+
+
 def parse_post_url(raw: str) -> ParsedPostUrl:
     text = (raw or "").strip()
     if not text:
